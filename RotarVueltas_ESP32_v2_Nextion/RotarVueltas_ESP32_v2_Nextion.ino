@@ -1,13 +1,36 @@
 /*
- * RotarVueltas_ESP32_IR.ino
- * Control del servo STS3215 en modo rueda (giro continuo) con ESP32 WROOM.
+ * RotarVueltas_ESP32_v2_Nextion.ino
+ * Control del servo STS3215 en modo rueda (giro continuo) con ESP32 WROOM,
+ * basado en RotarVueltas_ESP32_v2, con alertas enviadas a una pantalla
+ * Nextion:
+ *   - Interrupcion de EMERGENCIA (GPIO 4)     -> cambia a la pagina 5 de la Nextion.
+ *   - Interrupcion de BURBUJA IR (GPIO 14)    -> muestra la imagen de alerta "p1"
+ *                                                 durante ALERTA_DURACION_MS y luego la oculta.
+ *
  * Funcion principal: rotarVueltas(n, t)
  *   n = numero de vueltas (decimales OK, negativo = sentido contrario)
  *   t = tiempo en segundos (decimales OK)
  *
  * Hardware:
  *   - ESP32 WROOM
- *   - Serial2 hardware: RX=16, TX=17
+ *   - Serial2 hardware: RX=16, TX=17 (comunicacion con el servo)
+ *   - Serial (UART0, pines nativos RX0/TX0): comunicacion con la Nextion Y
+ *     entrada de comandos por el Monitor Serial (mismo cable fisico).
+ *
+ * IMPORTANTE - por que TODO se envia con enviarSerial() y nunca con
+ * Serial.print/println directo:
+ *   La Nextion no ejecuta un comando hasta detectar 3 bytes 0xFF seguidos.
+ *   Si se manda texto de depuracion sin ese terminador, la Nextion lo
+ *   concatena con el siguiente comando real y termina rechazando ambos
+ *   (por eso antes "vis p1,1" y "page 5" fallaban de forma intermitente).
+ *   enviarSerial() cierra siempre el mensaje con 0xFF 0xFF 0xFF para que
+ *   cada envio sea un frame independiente.
+ *   Ademas, en setup() se manda "bkcmd=0" para que la Nextion deje de
+ *   contestar con codigos de exito/error por cada comando: esas respuestas
+ *   llegaban por el mismo RX0 que usa Serial.parseFloat() para leer
+ *   "vueltas tiempo" desde el Monitor Serial y corrompian esa lectura
+ *   (causa del "Formato invalido" intermitente y de que a veces no
+ *   arrancara el motor).
  *
  * Pines de interrupcion:
  *   - GPIO 4  : Parada de emergencia       (FALLING)
@@ -24,22 +47,37 @@
  *   Si tu modulo esta cableado al reves (activo en alto), cambia FALLING por
  *   RISING en el attachInterrupt correspondiente.
  *
+ * Fines de carrera - anti-rebote por desactivacion temporal:
+ *   Al activarse un fin de carrera, ademas de detener el motor, se desactiva
+ *   (detachInterrupt) la interrupcion de ESE pin especifico. Esto evita que,
+ *   al mover el motor en sentido contrario para alejarse del interruptor, el
+ *   rebote mecanico del propio interruptor vuelva a disparar la interrupcion.
+ *   La interrupcion se reactiva sola cuando se cumplen DOS condiciones:
+ *     1) Ya paso al menos REARME_FIN_CARRERA_MS desde que se desactivo.
+ *     2) El pin ya no esta presionado (se lee HIGH, gracias al pull-up).
+ *   Esa verificacion se hace en revisarRearmeFinesDeCarrera(), llamada tanto
+ *   en loop() como dentro del while de rotarVueltas().
+ *
+ * Monitoreo periodico de corriente del motor:
+ *   Cada INTERVALO_MONITOREO_CORRIENTE_MS milisegundos se lee la corriente
+ *   del servo (sms_sts.ReadCurrent) y se imprime por Serial. La conversion a
+ *   mA usa 6.5 mA/unidad (resolucion tipica de los servos STS); verificar
+ *   contra el datasheet si se requiere precision exacta.
+ *
  * Entrada por monitor serial: vueltas tiempo
  *   Ejemplo: 2.0 10.0  -> 2 vueltas en 10 segundos
  *
  * Unidades de velocidad de la libreria:
  *   1 unidad = 0.0146 RPM  (ajustado empiricamente para STS3215)
  *
- * ---------- AGREGADOS (2026-07-06) ----------
- * - Monitoreo periodico de corriente del motor cada 1000 ms.
- * - Antirrebote para fines de carrera: al dispararse se desactiva la
- *   interrupcion de ese pin durante 1 segundo y solo se reactiva cuando
- *   el interruptor ya no esta presionado (lectura HIGH).
- * - Reenvio periodico del comando de velocidad dentro del bucle de
- *   rotarVueltas() para evitar el timeout del servo.
+ * Componente Nextion requerido:
+ *   - Picture "p1": imagen de alerta de BURBUJA. Colocarla donde debe
+ *     verse, con la imagen (.pic) ya asignada, y su atributo vis inicial
+ *     en 0 (oculta). Si tu componente tiene otro nombre, cambia OBJ_BURBUJA.
+ *   - Pagina numero 5: pagina de alerta de emergencia en el proyecto Nextion.
  */
 
-#include "D:/DOCUMENTOS MICHAEL PERALTA/BOMBA/motor2/FTServo_Arduino/examples/SMS_STS/tiempos_corregidos/SCServo.h"
+#include "D:/DOCUMENTOS MICHAEL PERALTA/BOMBA/motor2/FTServo_Arduino/examples/SMS_STS/RotarVueltas_ESP32_v2_Nextion/SCServo.h"
 
 // --- Pines Serial2 para el servo ---
 #define SERVO_RX_PIN  16
@@ -51,20 +89,32 @@
 #define PIN_FIN_CARRERA2  13
 #define PIN_IR_BURBUJA    14
 
+// --- Nextion: baud (debe coincidir con el proyecto Nextion) ---
+#define NEXTION_BAUD 115200
+
+// --- Nextion: componente Picture de alerta de burbuja ---
+#define OBJ_BURBUJA "p1"
+
+// --- Nextion: pagina a la que se salta en caso de emergencia ---
+#define PAGINA_EMERGENCIA 5
+
+// --- Nextion: duracion en pantalla de la imagen de alerta de burbuja ---
+#define ALERTA_DURACION_MS 3000
+
 SMS_STS sms_sts;
 
 const uint8_t  SERVO_ID       = 4;
 const float    RPM_POR_UNIDAD = 0.0146f;
 const int16_t  SPEED_MAX      = 4095;
 
-// --- Antirebote general: tiempo minimo entre dos disparos del mismo pin ---
+// --- Antirebote: tiempo minimo entre dos disparos del mismo pin ---
 #define DEBOUNCE_MS 200
 
-// --- Antirrebote fines de carrera: tiempo minimo desactivada antes de
+// --- Antirebote de fines de carrera: tiempo minimo desactivada antes de
 //     poder reactivarse (ademas de requerir que el pin ya no este presionado) ---
 #define REARME_FIN_CARRERA_MS 1000
 
-// --- Monitoreo periodico de corriente ---
+// --- Monitoreo periodico de corriente del motor ---
 #define INTERVALO_MONITOREO_CORRIENTE_MS 1000
 
 // --- Flags de interrupcion (accedidos desde ISR y codigo principal) ---
@@ -80,14 +130,19 @@ volatile unsigned long tUltimaFinCarrera1    = 0;
 volatile unsigned long tUltimaFinCarrera2    = 0;
 volatile unsigned long tUltimaIRBurbuja      = 0;
 
-// --- Variables para antirrebote de fines de carrera ---
+// Estado de activacion de la interrupcion de cada fin de carrera y marca de
+// tiempo de su desactivacion (para el rearme automatico).
 bool          interrupcionFC1Activa = true;
 bool          interrupcionFC2Activa = true;
 unsigned long tDesactivacionFC1     = 0;
 unsigned long tDesactivacionFC2     = 0;
 
-// --- Variable para monitoreo de corriente ---
+// Marca de tiempo del ultimo monitoreo de corriente
 unsigned long tUltimoMonitoreoCorriente = 0;
+
+// Estado de visibilidad de la imagen de alerta de burbuja en la Nextion
+bool          burbujaVisible   = false;
+unsigned long burbujaOcultarEn = 0;
 
 // -----------------------------------------------------------------------
 // ISR - deben estar en RAM para ESP32
@@ -128,10 +183,43 @@ void IRAM_ATTR isrIRBurbuja() {
 }
 
 // -----------------------------------------------------------------------
+// enviarSerial: unica funcion que escribe en Serial (UART0). Usarla SIEMPRE
+// en vez de Serial.print/println, para que cada mensaje -sea de depuracion
+// o un comando Nextion- quede cerrado con el terminador 0xFF 0xFF 0xFF y
+// nunca se mezcle con el siguiente envio.
+// -----------------------------------------------------------------------
+void enviarSerial(const String &msg) {
+  Serial.print(msg);
+  Serial.write(0xFF);
+  Serial.write(0xFF);
+  Serial.write(0xFF);
+}
+
+void mostrarImagenNextion(const char *objeto, bool visible) {
+  enviarSerial("vis " + String(objeto) + "," + String(visible ? 1 : 0));
+}
+
+void cambiarPaginaNextion(int pagina) {
+  enviarSerial("page " + String(pagina));
+}
+
+// -----------------------------------------------------------------------
+// revisarOcultarAlertaBurbuja: oculta la imagen de alerta de burbuja cuando
+// ya paso su tiempo de duracion en pantalla. Se debe llamar periodicamente
+// desde loop() y desde el while de rotarVueltas().
+// -----------------------------------------------------------------------
+void revisarOcultarAlertaBurbuja() {
+  if (burbujaVisible && (long)(millis() - burbujaOcultarEn) >= 0) {
+    mostrarImagenNextion(OBJ_BURBUJA, false);
+    burbujaVisible = false;
+  }
+}
+
+// -----------------------------------------------------------------------
 // revisarRearmeFinesDeCarrera: reactiva la interrupcion de un fin de carrera
 // una vez que ya paso el tiempo de espera y el interruptor ya no esta
-// presionado. Se llama periodicamente desde loop() y desde el while
-// de rotarVueltas().
+// presionado. Se debe llamar periodicamente desde loop() y desde el while
+// de rotarVueltas(), para que el rearme ocurra aunque el motor siga girando.
 // -----------------------------------------------------------------------
 void revisarRearmeFinesDeCarrera() {
   unsigned long ahora = millis();
@@ -141,7 +229,7 @@ void revisarRearmeFinesDeCarrera() {
       digitalRead(PIN_FIN_CARRERA1) == HIGH) {
     attachInterrupt(digitalPinToInterrupt(PIN_FIN_CARRERA1), isrFinCarrera1, FALLING);
     interrupcionFC1Activa = true;
-    Serial.println("[INFO] Interrupcion FinCarrera1 reactivada.");
+    enviarSerial("[INFO] Interrupcion de Fin de carrera 1 reactivada.");
   }
 
   if (!interrupcionFC2Activa &&
@@ -149,7 +237,7 @@ void revisarRearmeFinesDeCarrera() {
       digitalRead(PIN_FIN_CARRERA2) == HIGH) {
     attachInterrupt(digitalPinToInterrupt(PIN_FIN_CARRERA2), isrFinCarrera2, FALLING);
     interrupcionFC2Activa = true;
-    Serial.println("[INFO] Interrupcion FinCarrera2 reactivada.");
+    enviarSerial("[INFO] Interrupcion de Fin de carrera 2 reactivada.");
   }
 }
 
@@ -164,11 +252,9 @@ void monitorearCorriente() {
 
   int corriente = sms_sts.ReadCurrent(SERVO_ID);
   if (corriente == -1) {
-    Serial.println("[MONITOREO] Error leyendo corriente.");
+    enviarSerial("[MONITOREO] Error leyendo corriente del motor.");
   } else {
-    Serial.print("[MONITOREO] Corriente: ");
-    Serial.print(corriente * 6.5f);
-    Serial.println(" mA");
+    enviarSerial("[MONITOREO] Corriente del motor: " + String(corriente * 6.5f) + " mA");
   }
 }
 
@@ -182,33 +268,36 @@ bool procesarInterrupciones() {
   sms_sts.WriteSpe(SERVO_ID, 0, 0);   // detener motor de inmediato
 
   if (flagEmergencia) {
-    Serial.println("[INTERRUPCION] Parada de emergencia detectada! Motor detenido 5 s.");
     flagEmergencia = false;
+    enviarSerial("[INTERRUPCION] Parada de emergencia detectada! Motor detenido 5 segundos.");
+    cambiarPaginaNextion(PAGINA_EMERGENCIA);
   }
   if (flagFinCarrera1) {
-    Serial.println("[INTERRUPCION] Fin de carrera 1 detectado! Motor detenido 5 s.");
     flagFinCarrera1 = false;
-    // Desactivar interrupcion para evitar rebotes
+    enviarSerial("[INTERRUPCION] Fin de carrera 1 detectado! Motor detenido 5 segundos.");
     if (interrupcionFC1Activa) {
       detachInterrupt(digitalPinToInterrupt(PIN_FIN_CARRERA1));
       interrupcionFC1Activa = false;
       tDesactivacionFC1     = millis();
-      Serial.println("[INFO] Interrupcion FinCarrera1 desactivada temporalmente.");
+      enviarSerial("[INFO] Interrupcion de Fin de carrera 1 desactivada temporalmente.");
     }
   }
   if (flagFinCarrera2) {
-    Serial.println("[INTERRUPCION] Fin de carrera 2 detectado! Motor detenido 5 s.");
     flagFinCarrera2 = false;
+    enviarSerial("[INTERRUPCION] Fin de carrera 2 detectado! Motor detenido 5 segundos.");
     if (interrupcionFC2Activa) {
       detachInterrupt(digitalPinToInterrupt(PIN_FIN_CARRERA2));
       interrupcionFC2Activa = false;
       tDesactivacionFC2     = millis();
-      Serial.println("[INFO] Interrupcion FinCarrera2 desactivada temporalmente.");
+      enviarSerial("[INFO] Interrupcion de Fin de carrera 2 desactivada temporalmente.");
     }
   }
   if (flagIRBurbuja) {
-    Serial.println("[INTERRUPCION] Burbuja detectada! Motor detenido 5 s.");
     flagIRBurbuja = false;
+    enviarSerial("[INTERRUPCION] Burbuja detectada por sensor IR HX-M121! Motor detenido 5 segundos.");
+    mostrarImagenNextion(OBJ_BURBUJA, true);
+    burbujaVisible   = true;
+    burbujaOcultarEn = millis() + ALERTA_DURACION_MS;
   }
 
   hayInterrupcion = false;
@@ -235,45 +324,14 @@ void rotarVueltas(float n, float t) {
   unsigned long tStart = millis();
   unsigned long tTotal = (unsigned long)(t * 1000.0f);
 
-  // --- DEBUG TEMPORAL: contador de vueltas reales (QUITAR luego de la prueba) ---
-  int           posAnteriorDebug     = sms_sts.ReadPos(SERVO_ID);
-  long          pasosAcumDebug       = 0;
-  unsigned long tUltimoPrintDebug    = millis();
-
   while (millis() - tStart < tTotal) {
     if (procesarInterrupciones()) {
-      // Asegurar freno antes de salir
-      sms_sts.WriteSpe(SERVO_ID, 0, 0);
-      Serial.println("Rotacion cancelada por interrupcion.");
+      enviarSerial("Rotacion cancelada por interrupcion.");
       return;
     }
-
-    // --- REENVIO PERIODICO DEL COMANDO DE VELOCIDAD ---
-    // Evita el timeout del servo
-    sms_sts.WriteSpe(SERVO_ID, speedVal, 0);
-
-    // --- LLAMAR A LAS NUEVAS FUNCIONES ---
     revisarRearmeFinesDeCarrera();
+    revisarOcultarAlertaBurbuja();
     monitorearCorriente();
-
-    // --- DEBUG TEMPORAL: acumular vueltas detectando wraparound (0-4095 = 1 vuelta) ---
-    int posActualDebug = sms_sts.ReadPos(SERVO_ID);
-    if (posActualDebug >= 0) {
-      if (posAnteriorDebug >= 0) {
-        int delta = posActualDebug - posAnteriorDebug;
-        if (delta >  2048) delta -= 4096;
-        if (delta < -2048) delta += 4096;
-        pasosAcumDebug += delta;
-      }
-      posAnteriorDebug = posActualDebug;
-    }
-
-    if (millis() - tUltimoPrintDebug >= 1000) {
-      tUltimoPrintDebug = millis();
-      Serial.print("[DEBUG] Vueltas acumuladas: ");
-      Serial.println((float)pasosAcumDebug / 4096.0f, 3);
-    }
-
     delay(10);
   }
 
@@ -281,20 +339,22 @@ void rotarVueltas(float n, float t) {
   delay(50);
 
   int posFinal = sms_sts.ReadPos(SERVO_ID);
-  Serial.print("<< Detenido. Pos=");
-  Serial.println(posFinal);
-
-  // --- DEBUG TEMPORAL: total final de vueltas reales (QUITAR luego de la prueba) ---
-  Serial.print("[DEBUG] Vueltas totales reales: ");
-  Serial.println((float)pasosAcumDebug / 4096.0f, 3);
+  enviarSerial("<< Detenido. Pos=" + String(posFinal));
 }
 
 // -----------------------------------------------------------------------
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(NEXTION_BAUD);
   Serial2.begin(115200, SERIAL_8N1, SERVO_RX_PIN, SERVO_TX_PIN);
   sms_sts.pSerial = &Serial2;
   delay(1000);
+
+  // Silenciar las respuestas automaticas de la Nextion (exito/error por
+  // cada comando). Deben dejar de llegar por RX0 antes de que empecemos a
+  // leer "vueltas tiempo" desde el Monitor Serial por ese mismo pin.
+  enviarSerial("bkcmd=0");
+  delay(50);
+  while (Serial.available()) Serial.read();  // descartar cualquier respuesta residual
 
   // Configurar pines de interrupcion con pull-up interno
   pinMode(PIN_EMERGENCIA,   INPUT_PULLUP);
@@ -307,17 +367,19 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(13), isrFinCarrera2, FALLING);
   attachInterrupt(digitalPinToInterrupt(14), isrIRBurbuja,   FALLING);
 
+  // Ocultar la imagen de alerta de burbuja al arrancar
+  mostrarImagenNextion(OBJ_BURBUJA, false);
+
   // Verificar comunicacion con el servo
   int ping = sms_sts.Ping(SERVO_ID);
   if (ping < 0) {
-    Serial.println("ERROR: No responde el servo. Verifica:");
-    Serial.println("  1) Baud rate (STS3215 default = 1,000,000 - debe estar en 115200)");
-    Serial.println("  2) Cables en RX=16, TX=17");
-    Serial.println("  3) ID del servo");
+    enviarSerial("ERROR: No responde el servo. Verifica:\r\n"
+                 "  1) Baud rate (STS3215 default = 1,000,000 - debe estar en 115200)\r\n"
+                 "  2) Cables en RX=16, TX=17\r\n"
+                 "  3) ID del servo");
     while (true) delay(1000);
   }
-  Serial.print("Servo detectado. ID=");
-  Serial.println(ping);
+  enviarSerial("Servo detectado. ID=" + String(ping));
 
   // Desbloquear EPROM y poner en modo rueda (giro continuo)
   sms_sts.unLockEprom(SERVO_ID);
@@ -331,16 +393,27 @@ void setup() {
   sms_sts.EnableTorque(SERVO_ID, 1);
   delay(100);
 
-  Serial.println("Servo listo. Interrupciones activas.");
-  Serial.println("Ingresa: vueltas tiempo   (ej: 2.0 10.0)");
+  enviarSerial("Servo listo. Interrupciones activas.\r\nIngresa: vueltas tiempo   (ej: 2.0 10.0)");
 }
 
 void loop() {
   procesarInterrupciones();
   revisarRearmeFinesDeCarrera();
+  revisarOcultarAlertaBurbuja();
   monitorearCorriente();
 
   if (Serial.available()) {
+    int primerByte = Serial.peek();
+    bool esInicioDeNumero = (primerByte == '-' || primerByte == '+' || primerByte == '.' ||
+                             (primerByte >= '0' && primerByte <= '9'));
+
+    // Byte espurio (respuesta/evento de la Nextion, no un numero real):
+    // descartarlo en silencio, sin interpretarlo como comando invalido.
+    if (!esInicioDeNumero) {
+      Serial.read();
+      return;
+    }
+
     float vueltas = Serial.parseFloat();
     float tiempo  = Serial.parseFloat();
 
@@ -348,15 +421,11 @@ void loop() {
     while (Serial.available()) Serial.read();
 
     if (vueltas != 0.0f && tiempo > 0.0f) {
-      Serial.print("Rotando ");
-      Serial.print(vueltas);
-      Serial.print(" vuelta(s) en ");
-      Serial.print(tiempo);
-      Serial.println(" segundo(s)...");
+      enviarSerial("Rotando " + String(vueltas) + " vuelta(s) en " + String(tiempo) + " segundo(s)...");
       rotarVueltas(vueltas, tiempo);
-      Serial.println("Listo. Ingresa: vueltas tiempo");
+      enviarSerial("Listo. Ingresa: vueltas tiempo");
     } else {
-      Serial.println("Formato invalido. Usa: vueltas tiempo   (ej: 2.0 10.0)");
+      enviarSerial("Formato invalido. Usa: vueltas tiempo   (ej: 2.0 10.0)");
     }
   }
 }
