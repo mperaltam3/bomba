@@ -1568,14 +1568,17 @@ bool confirmarEventoReal(uint8_t pin, uint8_t nivelActivo) {
 // -----------------------------------------------------------------------
 // procesarInterrupciones: la burbuja IR NUNCA detiene el motor - solo es
 // una alerta visual en la Nextion, el motor sigue girando igual. Emergencia
-// y los fines de carrera SI detienen el motor: de inmediato ante el flag
-// (para no perder reaccion), y luego se confirman con confirmarEventoReal().
-// Si esa parada resulta ser ruido, se reanuda el giro a la misma velocidad
-// sin los 5 s de espera; si es real, se procesa (mensaje, pagina Nextion,
-// bloqueo de fin de carrera) y el motor queda detenido 5 s.
-// Retorna true si el motor quedo detenido por una interrupcion real de
-// parada (emergencia o fin de carrera) - la burbuja nunca hace que retorne
-// true, para no cancelar la rotacion en curso.
+// y los fines de carrera SI detienen el motor de inmediato ante el flag
+// (para no perder reaccion). Los fines de carrera ademas se confirman con
+// confirmarEventoReal(): si esa parada resulta ser ruido, se reanuda el
+// giro a la misma velocidad sin los 5 s de espera; si es real, se procesa
+// (mensaje, pagina Nextion, bloqueo de fin de carrera) y el motor queda
+// detenido 5 s.
+// La EMERGENCIA es la excepcion: NUNCA pasa por el filtro de ruido ni se
+// auto-reanuda (ver CORRECCION DE SEGURIDAD mas abajo, junto a
+// emergenciaReal). Retorna true si el motor quedo detenido por una
+// interrupcion real de parada (emergencia o fin de carrera) - la burbuja
+// nunca hace que retorne true, para no cancelar la rotacion en curso.
 // -----------------------------------------------------------------------
 bool procesarInterrupciones() {
   if (!hayInterrupcion) return false;
@@ -1604,7 +1607,23 @@ bool procesarInterrupciones() {
 
   sms_sts.WriteSpe(SERVO_ID, 0, 0);   // detener motor de inmediato, sin esperar la confirmacion
 
-  bool emergenciaReal  = huboEmergencia  && confirmarEventoReal(PIN_EMERGENCIA, LOW);
+  // CORRECCION DE SEGURIDAD: la emergencia YA NO pasa por confirmarEventoReal().
+  // Antes, un solo blip de ruido/EMI en el flanco (GPIO4 es un pin RTC/touch,
+  // sensible a acoplamiento capacitivo - ver "Filtro de ruido/EMI" arriba)
+  // bastaba para que el filtro de 20 ms lo descartara como "ruido" y el
+  // codigo mandara sms_sts.WriteSpe(SERVO_ID, velocidadActual, 0) unas lineas
+  // mas abajo: el motor volvia a moverse solo, sin intervencion del operador,
+  // justo cuando se habia detectado una emergencia real. A diferencia de los
+  // fines de carrera (que SI tienen sentido reanudar solos si fue ruido, ya
+  // que son parte normal del recorrido), la emergencia NO tiene ningun camino
+  // de "continuar": rotarVueltas() la trata siempre como cancelacion total
+  // (ver el "if (procesarInterrupciones())" en rotarVueltas(), que hace
+  // return sin ofrecer continuar) y el unico camino de recuperacion es un
+  // nuevo comando del operador (tipicamente COMANDO_REGRESO). Por lo tanto,
+  // ante la duda, siempre se trata como evento real: es preferible una
+  // parada de mas por un falso positivo que dejar corriendo el motor tras
+  // una señal de emergencia real descartada por error.
+  bool emergenciaReal  = huboEmergencia;
   bool finCarrera1Real = huboFinCarrera1 && confirmarEventoReal(PIN_FIN_CARRERA1, LOW);
   bool finCarrera2Real = huboFinCarrera2 && confirmarEventoReal(PIN_FIN_CARRERA2, LOW);
 
