@@ -2019,6 +2019,25 @@ void rotarVueltas(float n, float minutos) {
       tStart += (millis() - tPausaInicio);
       tInicioAsentamientoCorriente = millis();
       sonarInicioMovimiento();
+
+      // CORRECCION: una emergencia (o fin de carrera) puede haberse
+      // disparado justo durante el beep de reanudacion (bloqueante, 150 ms)
+      // o en el instante justo despues de que esperarComandoSobrecorriente()
+      // ya habia leido la 'C' - el flag queda pendiente (hayInterrupcion)
+      // pero todavia no se proceso. Si no se revisa aqui, controlarVelocidad
+      // Objetivo() de mas abajo comandaria una velocidad nueva ANTES de que
+      // el proximo procesarInterrupciones() (recien al tope del while)
+      // llegue a detener el motor: la reanudacion por 'C' se solaparia con
+      // la parada por emergencia, dejando al motor moviendose de mas
+      // despues de una emergencia real ya detectada. Revisando aqui, ANTES
+      // de comandar cualquier velocidad nueva, se cierra esa ventana.
+      if (procesarInterrupciones()) {
+        enviarDebug("Rotacion cancelada por interrupcion justo al reanudar tras sobrecorriente. "
+                     "Vueltas acumuladas: " + String(vueltasActuales(), 3));
+        if (giroNormalAdelante) desactivarSensorIR();
+        return;
+      }
+
       enviarDebug("[SOBRECORRIENTE] Reanudando movimiento...");
       tUltimoControlVelocidad = 0;
     }
