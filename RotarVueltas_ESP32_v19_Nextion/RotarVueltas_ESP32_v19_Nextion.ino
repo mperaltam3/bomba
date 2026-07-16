@@ -1656,7 +1656,19 @@ bool procesarInterrupciones() {
     }
   }
 
-  delay(1000);
+  // Reenvio de seguridad: Serial2 hacia el servo es un bus medio-duplex
+  // compartido, y un solo paquete de "velocidad 0" (el de la linea 1614)
+  // puede corromperse por EMI justo cuando mas ruido electrico hay - por
+  // ejemplo, al frenar un motor que estaba bajo carga tras reanudar de una
+  // sobrecorriente. Si ese unico paquete se pierde, el ESP32 detecta y
+  // procesa la emergencia correctamente (mensaje, pagina Nextion, beep) pero
+  // el servo nunca recibe la orden de pararse y sigue girando. Repetir el
+  // comando de parada varias veces durante esta espera de 5 s asegura que
+  // llegue aunque el primer intento se pierda.
+  for (int i = 0; i < 10; i++) {
+    delay(100);
+    sms_sts.WriteSpe(SERVO_ID, 0, 0);
+  }
   return true;
 }
 
