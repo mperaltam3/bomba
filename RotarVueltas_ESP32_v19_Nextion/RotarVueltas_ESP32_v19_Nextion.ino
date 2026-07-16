@@ -876,6 +876,17 @@ int16_t velocidadActual = 0;
 // inesperado), sin depender de un retorno adicional de esa funcion.
 int ultimaTipoParada = 0;
 
+// true desde que se confirma una emergencia real hasta que el operador
+// manda COMANDO_REGRESO ('r'/'R'). Mientras esta en true, loop() rechaza
+// cualquier comando nuevo de "vueltas tiempo_en_minutos" (ver el chequeo
+// en loop()) - el unico camino de recuperacion tras una emergencia es
+// regresar a home primero. Evita que un comando "vueltas tiempo" que
+// llegue justo despues de la emergencia (por ejemplo, un valor que la
+// propia Nextion reenvia sola al volver de la pagina de alarma a la
+// pagina principal) arranque una rotacion nueva sin que el operador lo
+// haya decidido conscientemente.
+bool bloqueadoPorEmergencia = false;
+
 // --- Conteo de vueltas (calibracion) ---
 int           posAnteriorVueltas  = 0;
 long          pasosAcumulados     = 0;
@@ -1629,6 +1640,7 @@ bool procesarInterrupciones() {
 
   if (emergenciaReal) {
     ultimaTipoParada = 1;
+    bloqueadoPorEmergencia = true;
     enviarDebug("[INTERRUPCION] Parada de emergencia detectada! Motor detenido 5 segundos.");
     cambiarPaginaNextion(PAGINA_EMERGENCIA);
     sonarAlerta();
@@ -1727,6 +1739,12 @@ int esperarComandoSobrecorriente() {
 // incorrecta.
 // -----------------------------------------------------------------------
 void secuenciaRegreso() {
+
+  // El regreso a home es el UNICO camino de recuperacion reconocido tras
+  // una emergencia real (ver bloqueadoPorEmergencia): al iniciarlo, el
+  // operador ya tomo la accion explicita requerida, asi que se levanta el
+  // bloqueo y loop() vuelve a aceptar comandos nuevos de "vueltas tiempo".
+  bloqueadoPorEmergencia = false;
 
   // El regreso a home NUNCA es "giro hacia adelante en modo normal": el
   // sensor IR (emisor + interrupcion) debe quedar apagado durante toda la
@@ -2212,6 +2230,19 @@ void loop() {
 
     // Limpiar cualquier basura restante en el buffer
     while (Serial.available()) Serial.read();
+
+    // Tras una emergencia real, se rechaza cualquier "vueltas tiempo" nuevo
+    // hasta que el operador mande COMANDO_REGRESO ('r'/'R') - ver
+    // bloqueadoPorEmergencia. Esto evita arrancar una rotacion nueva con un
+    // comando que llegue automaticamente justo despues de la emergencia
+    // (por ejemplo, si la Nextion reenvia los ultimos valores al volver de
+    // la pagina de alarma a la pagina principal) sin que el operador lo
+    // haya decidido conscientemente.
+    if (bloqueadoPorEmergencia) {
+      enviarDebug("[BLOQUEADO] Hubo una parada de emergencia: envia '" + String(COMANDO_REGRESO) +
+                   "' para regresar a home antes de iniciar una nueva rotacion.");
+      return;
+    }
 
     if (vueltas != 0.0f && tiempo > 0.0f && tiempo <= TIEMPO_MAX_MINUTOS) {
       enviarDebug("Rotando " + String(vueltas) + " vuelta(s) en " + String(tiempo) + " minuto(s)...");
